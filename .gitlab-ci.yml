@@ -11,259 +11,293 @@ variables:
   ALLOW_ROOT: "yes"
   COLUMNS: "160"
   MANAGE_ACNG: "no"
-  ENABLE_EXTENSIONS: "preset-firstrun"
-  
-  # StorLoko DNS/SSL v4.0 Configuration - Per-Device IAM
-  STORLOKO_API_URL: "https://api.storloko.com"
-  STORLOKO_PROVISION_TOKEN: "$CI_PROVISION_TOKEN"
-  
-  # Device configuration (override via pipeline trigger)
-  DEVICE_SERIAL: ""  # Set via API trigger or generate in prep stage
-  # Pushover notifications
-  PUSHOVER_API_TOKEN: "$CI_PUSHOVER_API_TOKEN"
-  PUSHOVER_USER_KEY: "$CI_PUSHOVER_USER_KEY"
 
 stages:
-  - prepare
   - build
-  - test
-
-# Notification template job
-.notify:
-  image: registry.gh1.internal.storloko.com/storloko/arm-builder/alpine-notify:1.0
-  tags:
-    - docker
-  before_script:
-    - apk add --no-cache curl jq
-  allow_failure: true
+  - notify
 
 cache:
-  key: armbian-cache-${BOARD}
+  key: armbian-cache-${CI_JOB_NAME}
   paths:
     - armbian/cache/
     - armbian/.git/
 
-#############################################
-# STAGE 1: PREPARE DEVICE IAM CREDENTIALS
-#############################################
-prepare:iam:
-  stage: prepare
-  image: 
-    name: registry.gh1.internal.storloko.com/storloko/storloko-iam-provisioner:latest
-    entrypoint: [""]
-  tags:
-    - docker
-  before_script:
-    - yum install -y jq openssl bind-utils
-    - |
-      if [ -z "$DEVICE_SERIAL" ]; then
-        DEVICE_SERIAL="sl-$(openssl rand -hex 4)"
-        echo "Generated serial: $DEVICE_SERIAL"
-      else
-        echo "Using provided serial: $DEVICE_SERIAL"
-      fi
-      echo "$DEVICE_SERIAL" > device_serial.txt
-      DEVICE_HOSTNAME="device-${DEVICE_SERIAL}"
-      echo "$DEVICE_HOSTNAME" > device_hostname.txt
-      echo "=========================================="
-      echo "StorLoko Per-Device IAM Credential Setup"
-      echo "Serial: $DEVICE_SERIAL"
-      echo "Hostname: $DEVICE_HOSTNAME"
-      echo "=========================================="
-  script:
-    - |
-      DEVICE_SERIAL=$(cat device_serial.txt)
-      DEVICE_HOSTNAME=$(cat device_hostname.txt)
-      IAM_USERNAME="storloko-device-${DEVICE_SERIAL}"
-      echo "Creating IAM user: $IAM_USERNAME"
-      
-      aws iam create-user \
-        --user-name "$IAM_USERNAME" \
-        --tags Key=Device,Value="$DEVICE_SERIAL" Key=Type,Value=StorLokoDevice \
-        2>/dev/null || echo "User already exists"
-      
-      POLICY_NAME="storloko-device-${DEVICE_SERIAL}-route53"
-      
-      cat > /tmp/iam-policy.json <<EOF
-      {
-        "Version": "2012-10-17",
-        "Statement": [
-          {
-            "Effect": "Allow",
-            "Action": [
-              "route53:GetChange",
-              "route53:ListResourceRecordSets",
-              "route53:ListHostedZones",
-              "route53:ListHostedZonesByName"
-            ],
-            "Resource": "*"
-          },
-          {
-            "Effect": "Allow",
-            "Action": ["route53:ChangeResourceRecordSets"],
-            "Resource": "arn:aws:route53:::hostedzone/${ROUTE53_ZONE_ID}",
-            "Condition": {
-              "ForAllValues:StringLike": {
-                "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-                  "${DEVICE_HOSTNAME}.cust.storloko.com",
-                  "*.${DEVICE_HOSTNAME}.cust.storloko.com",
-                  "_acme-challenge.${DEVICE_HOSTNAME}.cust.storloko.com",
-                  "_acme-challenge.*.${DEVICE_HOSTNAME}.cust.storloko.com"
-                ]
-              }
-            }
-          }
-        ]
-      }
-      EOF
-      
-      POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POLICY_NAME}"
-      aws iam delete-user-policy --user-name "$IAM_USERNAME" --policy-name "$POLICY_NAME" 2>/dev/null || true
-      aws iam delete-policy --policy-arn "$POLICY_ARN" 2>/dev/null || true
-      aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file:///tmp/iam-policy.json --description "Route53 access for StorLoko device ${DEVICE_SERIAL}" || true
-      aws iam attach-user-policy --user-name "$IAM_USERNAME" --policy-arn "$POLICY_ARN"
-      
-      OLD_KEYS=$(aws iam list-access-keys --user-name "$IAM_USERNAME" --query 'AccessKeyMetadata[*].AccessKeyId' --output text || echo "")
-      for KEY in $OLD_KEYS; do
-        aws iam delete-access-key --user-name "$IAM_USERNAME" --access-key-id "$KEY" || true
-      done
-      
-      ACCESS_KEY_JSON=$(aws iam create-access-key --user-name "$IAM_USERNAME")
-      echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.AccessKeyId' > device_aws_access_key_id.txt
-      echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.SecretAccessKey' > device_aws_secret_access_key.txt
-      
-      cat > /tmp/dns-changes.json <<EOF
-      {
-        "Comment": "Initial DNS setup for StorLoko device ${DEVICE_SERIAL}",
-        "Changes": [
-          {"Action": "UPSERT", "ResourceRecordSet": {"Name": "${DEVICE_HOSTNAME}.cust.storloko.com", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-          {"Action": "UPSERT", "ResourceRecordSet": {"Name": "vaultwarden.${DEVICE_HOSTNAME}.cust.storloko.com", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-          {"Action": "UPSERT", "ResourceRecordSet": {"Name": "nextcloud.${DEVICE_HOSTNAME}.cust.storloko.com", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-          {"Action": "UPSERT", "ResourceRecordSet": {"Name": "immich.${DEVICE_HOSTNAME}.cust.storloko.com", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-          {"Action": "UPSERT", "ResourceRecordSet": {"Name": "jellyfin.${DEVICE_HOSTNAME}.cust.storloko.com", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}}
-        ]
-      }
-      EOF
-      
-      aws route53 change-resource-record-sets --hosted-zone-id "${ROUTE53_ZONE_ID}" --change-batch file:///tmp/dns-changes.json
-      
-  artifacts:
-    paths:
-      - device_serial.txt
-      - device_hostname.txt
-      - device_aws_access_key_id.txt
-      - device_aws_secret_access_key.txt
-    expire_in: 1 week
-
-#############################################
-# STAGE 2: BUILD DEVICE IMAGE
-#############################################
-build:rockpi-4cplus:
+##############################################
+# BUILD TEMPLATE
+# All scripts are inline heredocs due to Armbian bug:
+# userpatches scripts are ignored if pre-existing in repo.
+# Everything must be generated at build time.
+##############################################
+.build_template:
   stage: build
   tags:
     - arm64
-  image: storloko/armbian-builder:latest
-  dependencies:
-    - prepare:iam
   when: manual
+  timeout: 3h
+
   before_script:
-    - DEVICE_SERIAL=$(cat device_serial.txt)
-    - DEVICE_HOSTNAME=$(cat device_hostname.txt)
-    - DEVICE_AWS_ACCESS_KEY_ID=$(cat device_aws_access_key_id.txt)
-    - DEVICE_AWS_SECRET_ACCESS_KEY=$(cat device_aws_secret_access_key.txt)
+    - echo "==========================================="
+    - echo "StorLoko ARM Builder"
+    - echo "Board: ${BOARD} | Branch: ${BRANCH} | Release: ${RELEASE}"
+    - echo "==========================================="
     - git config --global --add safe.directory '*'
-    - rm -rf armbian && git clone --depth 1 ${ARMBIAN_REPO} armbian && cd armbian
-    - mkdir -p /armbian-cache/git-bare /armbian-cache/debs /armbian-cache/toolchain /armbian-cache/sources
-    - mkdir -p cache && rm -rf cache/git-bare cache/debs cache/toolchain cache/sources
+    - rm -rf armbian
+    - git clone --depth 1 ${ARMBIAN_REPO} armbian
+    - cd armbian
+    # Setup cache symlinks for faster rebuilds
+    - mkdir -p /armbian-cache/{git-bare,debs,toolchain,sources}
+    - mkdir -p cache
+    - rm -rf cache/{git-bare,debs,toolchain,sources}
     - ln -s /armbian-cache/git-bare cache/git-bare
     - ln -s /armbian-cache/debs cache/debs
     - ln -s /armbian-cache/toolchain cache/toolchain
     - ln -s /armbian-cache/sources cache/sources
-    - mkdir -p userpatches/extensions userpatches/overlay/root
+    # Create userpatches directory
+    - mkdir -p userpatches
+    #
+    # HEREDOC: customize-image.sh
+    # This runs during Armbian build (chroot into target image)
+    # Installs Docker - CasaOS installs on first boot
+    #
+    - |
+      cat > userpatches/customize-image.sh <<'CUSTOMIZE_EOF'
+      #!/bin/bash
+      #
+      # StorLoko customize-image.sh
+      # Runs during Armbian build (chroot into target image)
+      # Installs Docker only - CasaOS installed on first boot
+      #
+      set -e
+
+      RELEASE=$1
+      LINUXFAMILY=$2
+      BOARD=$3
+      BUILD_DESKTOP=$4
+
+      echo "==========================================="
+      echo "StorLoko Image Customization"
+      echo "Board: ${BOARD}"
+      echo "Release: ${RELEASE}"
+      echo "==========================================="
+
+      # Wait for apt locks (build system may still be running)
+      wait_for_apt() {
+          local max_wait=60
+          local waited=0
+          while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+                fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+              if [ $waited -ge $max_wait ]; then
+                  echo "Timeout waiting for apt locks"
+                  return 1
+              fi
+              echo "Waiting for apt locks..."
+              sleep 2
+              waited=$((waited + 2))
+          done
+      }
+
+      wait_for_apt
+
+      # Update package lists
+      apt-get update
+
+      # Install prerequisites
+      apt-get install -y \
+          curl \
+          ca-certificates \
+          gnupg \
+          lsb-release
+
+      # Install Docker
+      echo "Installing Docker..."
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+
+      echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      # Enable Docker
+      systemctl enable docker
+
+      # Create firstboot script to install CasaOS
+      echo "Setting up firstboot CasaOS installer..."
+      cat > /usr/local/bin/storloko-firstboot.sh <<'FIRSTBOOT'
+      #!/bin/bash
+      set -e
+
+      LOG="/var/log/storloko-firstboot.log"
+      MARKER="/etc/storloko-firstboot-done"
+
+      log() {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
+      }
+
+      if [ -f "$MARKER" ]; then
+          log "First boot already completed"
+          exit 0
+      fi
+
+      log "==========================================="
+      log "StorLoko First Boot"
+      log "==========================================="
+
+      # Wait for network
+      log "Waiting for network..."
+      for i in {1..30}; do
+          if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
+              log "Network available"
+              break
+          fi
+          sleep 2
+      done
+
+      # Install CasaOS
+      log "Installing CasaOS..."
+      export TERM=xterm
+      curl -fsSL https://get.casaos.io | bash -s -- --no-input 2>&1 | tee -a "$LOG"
+
+      log "==========================================="
+      log "✅ First boot complete"
+      log "==========================================="
+
+      touch "$MARKER"
+      systemctl disable storloko-firstboot.service
+      FIRSTBOOT
+      chmod +x /usr/local/bin/storloko-firstboot.sh
+
+      # Create systemd service for firstboot
+      cat > /etc/systemd/system/storloko-firstboot.service <<'SERVICE'
+      [Unit]
+      Description=StorLoko First Boot Setup
+      After=network-online.target docker.service
+      Wants=network-online.target
+      ConditionPathExists=!/etc/storloko-firstboot-done
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/storloko-firstboot.sh
+      RemainAfterExit=yes
+      StandardOutput=journal
+      StandardError=journal
+      Environment=TERM=xterm
+
+      [Install]
+      WantedBy=multi-user.target
+      SERVICE
+
+      systemctl enable storloko-firstboot.service
+
+      # Cleanup
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+
+      echo "==========================================="
+      echo "✅ Customization complete"
+      echo "   - Docker installed"
+      echo "   - CasaOS will install on first boot"
+      echo "==========================================="
+      CUSTOMIZE_EOF
+    - chmod +x userpatches/customize-image.sh
+    - echo "✅ userpatches/customize-image.sh created"
+
   script:
-    - echo "Starting Armbian build for ${DEVICE_SERIAL}..."
-    - sudo ALLOW_ROOT=yes COLUMNS=${COLUMNS} USE_CCACHE=${USE_CCACHE} ENABLE_EXTENSIONS=${ENABLE_EXTENSIONS} ./compile.sh BOARD=${BOARD} BRANCH=${BRANCH} RELEASE=${RELEASE} BUILD_MINIMAL=${BUILD_MINIMAL} BUILD_DESKTOP=${BUILD_DESKTOP} KERNEL_CONFIGURE=no COMPRESS_OUTPUTIMAGE="sha,xz"
+    - echo "Starting Armbian build..."
+    - |
+      ALLOW_ROOT=yes \
+      COLUMNS=${COLUMNS} \
+      MANAGE_ACNG=${MANAGE_ACNG} \
+      USE_CCACHE=${USE_CCACHE} \
+      KERNEL_CPUS=${KERNEL_CPUS} \
+      ./compile.sh \
+        BOARD=${BOARD} \
+        BRANCH=${BRANCH} \
+        RELEASE=${RELEASE} \
+        BUILD_MINIMAL=${BUILD_MINIMAL} \
+        BUILD_DESKTOP=${BUILD_DESKTOP} \
+        KERNEL_CONFIGURE=no \
+        COMPRESS_OUTPUTIMAGE="sha,xz"
+
   after_script:
     - |
+      BUILD_DATE=$(date +%Y-%m-%d)
       if [ -d "armbian/output/images" ]; then
-        DEVICE_SERIAL=$(cat device_serial.txt)
-        BUILD_DATE=$(date +%Y-%m-%d)
+        echo "==========================================="
+        echo "✅ Build complete"
+        echo "==========================================="
         cd armbian/output/images/
-        for file in *.img*; do
-          [ -f "$file" ] && mv "$file" "${DEVICE_SERIAL}-${file}"
-        done
-        for file in *; do
-          curl -X MKCOL "http://repo1.internal.storloko.com/storloko-builds/${BUILD_DATE}/" || true
-          curl -X MKCOL "http://repo1.internal.storloko.com/storloko-builds/${BUILD_DATE}/${DEVICE_SERIAL}/" || true
-          curl -T "$file" "http://repo1.internal.storloko.com/storloko-builds/${BUILD_DATE}/${DEVICE_SERIAL}/$file"
-        done
+        ls -la
+        # Upload logic would go here (WebDAV, S3, etc.)
+        # Example: curl -T "*.img.xz" "https://your-server/builds/${BUILD_DATE}/"
+      else
+        echo "❌ No build artifacts found"
+        exit 1
       fi
+
   artifacts:
     paths:
-      - device_serial.txt
-      - device_hostname.txt
+      - armbian/output/images/*.img.xz
+      - armbian/output/images/*.sha
     expire_in: 1 week
-  timeout: 3h
 
-# Board variants
+##############################################
+# BOARD JOBS
+##############################################
+build:rockpi-4cplus:
+  extends: .build_template
+  variables:
+    BOARD: "rockpi-4cplus"
+
 build:orangepi5-ultra:
-  extends: build:rockpi-4cplus
+  extends: .build_template
   variables:
     BOARD: "orangepi5-ultra"
     BRANCH: "vendor"
-  when: manual
-
-build:uefi-x86:
-  extends: build:rockpi-4cplus
-  variables:
-    BOARD: "uefi-x86"
-    BRANCH: "edge"
-  when: manual
-
-build:orangepi4-lts:
-  extends: build:rockpi-4cplus
-  variables:
-    BOARD: "orangepi4-lts"
-    BRANCH: "edge"
-    RELEASE: "noble"
-  when: manual
 
 build:orangepi5pro:
-  extends: build:rockpi-4cplus
+  extends: .build_template
   variables:
     BOARD: "orangepi5pro"
-    BRANCH: "edge"
-    RELEASE: "noble"
-  when: manual
+
+build:orangepi4-lts:
+  extends: .build_template
+  variables:
+    BOARD: "orangepi4-lts"
 
 build:rpi4b:
-  extends: build:rockpi-4cplus
+  extends: .build_template
   variables:
     BOARD: "rpi4b"
-  when: manual
 
-#############################################
-# NOTIFICATIONS
-#############################################
-notify:prepare-complete:
-  extends: .notify
-  stage: prepare
-  dependencies:
-    - prepare:iam
-  when: on_success
-  script:
-    - |
-      curl -s --form-string "token=${PUSHOVER_API_TOKEN}" --form-string "user=${PUSHOVER_USER_KEY}" \
-        --form-string "title=StorLoko: Prepare Complete" \
-        --form-string "message=IAM setup complete for $(cat device_serial.txt)" \
-        https://api.pushover.net/1/messages.json
+build:uefi-x86:
+  extends: .build_template
+  tags:
+    - amd64
+  variables:
+    BOARD: "uefi-x86"
 
-notify:prepare-failed:
-  extends: .notify
-  stage: prepare
+##############################################
+# NOTIFICATIONS (optional)
+##############################################
+notify:failure:
+  stage: notify
+  image: curlimages/curl:latest
+  tags:
+    - docker
   when: on_failure
+  allow_failure: true
   script:
     - |
-      curl -s --form-string "token=${PUSHOVER_API_TOKEN}" --form-string "user=${PUSHOVER_USER_KEY}" \
-        --form-string "title=StorLoko: Prepare Failed" --form-string "priority=1" \
-        https://api.pushover.net/1/messages.json
+      # Add your notification logic here (Pushover, Slack, etc.)
+      echo "Build failed for pipeline ${CI_PIPELINE_ID}"
+      # Example Pushover:
+      # curl -s -X POST https://api.pushover.net/1/messages.json \
+      #   -d "token=$PUSHOVER_API_TOKEN" \
+      #   -d "user=$PUSHOVER_USER_KEY" \
+      #   -d "title=ARM Build Failed" \
+      #   -d "message=Pipeline $CI_PIPELINE_ID failed"
