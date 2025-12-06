@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Project Status:** StorLoko was an Australian privacy-focused homecloud hardware company (2024-2025). This repository is now open source for the community to learn from, fork, and build upon.
+> **Project Status:** StorLoko was an Australian privacy-focused homecloud hardware company (2025). This repository is now open source for the community to learn from, fork, and build upon.
 
 Automated build system for homecloud device images using Armbian and GitLab CI/CD. Generates pre-configured ARM device images with built-in DNS automation and SSL certificates.
 
