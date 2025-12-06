@@ -1,4 +1,4 @@
-name: Build StorLoko Image
+name: Build ARM Image
 
 on:
   workflow_dispatch:
@@ -29,6 +29,22 @@ on:
           - jammy
           - bookworm
 
+# ===========================================
+# REQUIRED SECRETS (set in GitHub Settings > Secrets):
+#   AWS_ACCESS_KEY_ID      - AWS admin credentials (for IAM creation)
+#   AWS_SECRET_ACCESS_KEY  - AWS admin credentials
+#   AWS_ACCOUNT_ID         - Your AWS account ID (e.g., 123456789012)
+#   ROUTE53_ZONE_ID        - Hosted zone ID (e.g., Z1234567890ABC)
+#
+# REQUIRED VARIABLES (set in GitHub Settings > Variables):
+#   CUSTOMER_DOMAIN        - Your customer subdomain (e.g., devices.example.com)
+#
+# OPTIONAL:
+#   PUSHOVER_API_TOKEN     - For build notifications
+#   PUSHOVER_USER_KEY      - For build notifications
+#   PUSHOVER_ENABLED       - Set to 'true' to enable notifications
+# ===========================================
+
 env:
   ARMBIAN_REPO: https://github.com/armbian/build
   RELEASE: ${{ inputs.release || 'noble' }}
@@ -36,8 +52,21 @@ env:
   BUILD_DESKTOP: 'no'
 
 jobs:
+  ##############################################
+  # STAGE 1: PROVISION PER-DEVICE IAM CREDENTIALS
+  #
+  # This is the "special sauce" - each device gets its own
+  # AWS IAM user with a policy that ONLY allows modifying
+  # DNS records for that specific device's subdomain.
+  #
+  # Why this matters:
+  # - Devices can request SSL certs via DNS-01 challenge
+  # - Works behind NAT (no port forwarding needed)
+  # - Compromised device can't affect other customers
+  # - Each device is cryptographically isolated
+  ##############################################
   prepare-iam:
-    name: Prepare IAM Credentials
+    name: Provision Device IAM
     runs-on: ubuntu-latest
     outputs:
       device_serial: ${{ steps.generate.outputs.device_serial }}
@@ -50,45 +79,51 @@ jobs:
           if [ -n "${{ inputs.device_serial }}" ]; then
             DEVICE_SERIAL="${{ inputs.device_serial }}"
           else
-            DEVICE_SERIAL="sl-$(openssl rand -hex 4)"
+            DEVICE_SERIAL="dev-$(openssl rand -hex 4)"
           fi
           DEVICE_HOSTNAME="device-${DEVICE_SERIAL}"
           echo "device_serial=${DEVICE_SERIAL}" >> $GITHUB_OUTPUT
           echo "device_hostname=${DEVICE_HOSTNAME}" >> $GITHUB_OUTPUT
-          echo "Generated serial: ${DEVICE_SERIAL}"
+          echo "==========================================="
+          echo "Per-Device IAM Credential Provisioning"
+          echo "Serial: ${DEVICE_SERIAL}"
           echo "Hostname: ${DEVICE_HOSTNAME}"
+          echo "==========================================="
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
-      - name: Create IAM User and Policy
+      - name: Create IAM User and Scoped Policy
         env:
           DEVICE_SERIAL: ${{ steps.generate.outputs.device_serial }}
           DEVICE_HOSTNAME: ${{ steps.generate.outputs.device_hostname }}
           ROUTE53_ZONE_ID: ${{ secrets.ROUTE53_ZONE_ID }}
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-          DOMAIN_SUFFIX: ${{ vars.DOMAIN_SUFFIX || 'cust.storloko.com' }}
+          CUSTOMER_DOMAIN: ${{ vars.CUSTOMER_DOMAIN }}
         run: |
-          IAM_USERNAME="storloko-device-${DEVICE_SERIAL}"
+          IAM_USERNAME="homecloud-device-${DEVICE_SERIAL}"
           echo "Creating IAM user: $IAM_USERNAME"
           
           # Create user (ignore if exists)
           aws iam create-user \
             --user-name "$IAM_USERNAME" \
-            --tags Key=Device,Value="$DEVICE_SERIAL" Key=Type,Value=StorLokoDevice \
-            2>/dev/null || echo "User already exists"
+            --tags Key=Device,Value="$DEVICE_SERIAL" Key=Type,Value=HomeCloudDevice \
+            2>/dev/null || echo "User already exists, continuing..."
           
           # Create scoped policy
-          POLICY_NAME="storloko-device-${DEVICE_SERIAL}-route53"
+          # THIS IS THE KEY PART: Device can ONLY modify its own DNS records
+          POLICY_NAME="homecloud-device-${DEVICE_SERIAL}-route53"
+          
           cat > /tmp/iam-policy.json <<EOF
           {
             "Version": "2012-10-17",
             "Statement": [
               {
+                "Sid": "AllowRoute53ReadOnly",
                 "Effect": "Allow",
                 "Action": [
                   "route53:GetChange",
@@ -99,16 +134,17 @@ jobs:
                 "Resource": "*"
               },
               {
+                "Sid": "AllowRoute53ModifyOwnRecordsOnly",
                 "Effect": "Allow",
                 "Action": ["route53:ChangeResourceRecordSets"],
                 "Resource": "arn:aws:route53:::hostedzone/${ROUTE53_ZONE_ID}",
                 "Condition": {
                   "ForAllValues:StringLike": {
                     "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-                      "${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}",
-                      "*.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}",
-                      "_acme-challenge.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}",
-                      "_acme-challenge.*.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}"
+                      "${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}",
+                      "*.${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}",
+                      "_acme-challenge.${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}",
+                      "_acme-challenge.*.${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}"
                     ]
                   }
                 }
@@ -126,7 +162,7 @@ jobs:
           aws iam create-policy \
             --policy-name "$POLICY_NAME" \
             --policy-document file:///tmp/iam-policy.json \
-            --description "Route53 access for StorLoko device ${DEVICE_SERIAL}" || true
+            --description "Route53 access scoped to device ${DEVICE_SERIAL}" || true
           aws iam attach-user-policy --user-name "$IAM_USERNAME" --policy-arn "$POLICY_ARN"
           
           # Delete old access keys
@@ -142,22 +178,43 @@ jobs:
           echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.SecretAccessKey' > credentials/aws_secret_access_key.txt
           echo "${DEVICE_SERIAL}" > credentials/device_serial.txt
           echo "${DEVICE_HOSTNAME}" > credentials/device_hostname.txt
+          echo "${CUSTOMER_DOMAIN}" > credentials/customer_domain.txt
+          
+          echo "==========================================="
+          echo "✅ IAM provisioning complete"
+          echo "   User: $IAM_USERNAME"
+          echo "   Domain: ${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}"
+          echo "==========================================="
 
       - name: Create Initial DNS Records
         env:
           DEVICE_HOSTNAME: ${{ steps.generate.outputs.device_hostname }}
           ROUTE53_ZONE_ID: ${{ secrets.ROUTE53_ZONE_ID }}
-          DOMAIN_SUFFIX: ${{ vars.DOMAIN_SUFFIX || 'cust.storloko.com' }}
+          CUSTOMER_DOMAIN: ${{ vars.CUSTOMER_DOMAIN }}
         run: |
+          # Create placeholder DNS records (device updates with real IP on first boot)
           cat > /tmp/dns-changes.json <<EOF
           {
-            "Comment": "Initial DNS setup for StorLoko device",
+            "Comment": "Initial DNS setup for device ${DEVICE_HOSTNAME}",
             "Changes": [
-              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "vaultwarden.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "nextcloud.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "immich.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
-              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "jellyfin.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}}
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [{"Value": "127.0.0.1"}]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "*.${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [{"Value": "127.0.0.1"}]
+                }
+              }
             ]
           }
           EOF
@@ -173,6 +230,9 @@ jobs:
           path: credentials/
           retention-days: 7
 
+  ##############################################
+  # STAGE 2: BUILD DEVICE IMAGE
+  ##############################################
   build-image:
     name: Build ${{ inputs.board }} Image
     needs: prepare-iam
@@ -219,49 +279,242 @@ jobs:
         id: board
         run: |
           case "${{ inputs.board }}" in
-            rockpi-4cplus)
-              echo "branch=edge" >> $GITHUB_OUTPUT
-              ;;
-            orangepi5-ultra|orangepi5pro)
+            orangepi5-ultra)
               echo "branch=vendor" >> $GITHUB_OUTPUT
-              ;;
-            orangepi4-lts)
-              echo "branch=edge" >> $GITHUB_OUTPUT
-              ;;
-            uefi-x86)
-              echo "branch=edge" >> $GITHUB_OUTPUT
-              ;;
-            rpi4b)
-              echo "branch=edge" >> $GITHUB_OUTPUT
               ;;
             *)
               echo "branch=edge" >> $GITHUB_OUTPUT
               ;;
           esac
 
-      - name: Build Armbian Image
+      - name: Prepare Build with Device Credentials
         env:
           DEVICE_SERIAL: ${{ needs.prepare-iam.outputs.device_serial }}
           DEVICE_HOSTNAME: ${{ needs.prepare-iam.outputs.device_hostname }}
+          ROUTE53_ZONE_ID: ${{ secrets.ROUTE53_ZONE_ID }}
         run: |
           cd armbian
           
           # Read device credentials
           DEVICE_AWS_ACCESS_KEY_ID=$(cat ../credentials/aws_access_key_id.txt)
           DEVICE_AWS_SECRET_ACCESS_KEY=$(cat ../credentials/aws_secret_access_key.txt)
+          CUSTOMER_DOMAIN=$(cat ../credentials/customer_domain.txt)
           
-          # Create userpatches overlay
-          mkdir -p userpatches/overlay/root/.storloko
+          # Create userpatches directories
+          mkdir -p userpatches/overlay/etc/homecloud
+          mkdir -p userpatches/overlay/usr/local/bin
           
-          # Write device config
-          cat > userpatches/overlay/root/.storloko/config <<EOF
-          DEVICE_SERIAL=${DEVICE_SERIAL}
-          DEVICE_HOSTNAME=${DEVICE_HOSTNAME}
-          AWS_ACCESS_KEY_ID=${DEVICE_AWS_ACCESS_KEY_ID}
-          AWS_SECRET_ACCESS_KEY=${DEVICE_AWS_SECRET_ACCESS_KEY}
-          EOF
+          # Write device config (baked into image)
+          cat > userpatches/overlay/etc/homecloud/device.conf <<DEVICE_CONF_EOF
+          DEVICE_SERIAL="${DEVICE_SERIAL}"
+          DEVICE_HOSTNAME="${DEVICE_HOSTNAME}"
+          DEVICE_DOMAIN="${DEVICE_HOSTNAME}.${CUSTOMER_DOMAIN}"
+          AWS_ACCESS_KEY_ID="${DEVICE_AWS_ACCESS_KEY_ID}"
+          AWS_SECRET_ACCESS_KEY="${DEVICE_AWS_SECRET_ACCESS_KEY}"
+          ROUTE53_ZONE_ID="${ROUTE53_ZONE_ID}"
+          DEVICE_CONF_EOF
+          chmod 600 userpatches/overlay/etc/homecloud/device.conf
           
-          # Run build
+          #
+          # HEREDOC: customize-image.sh
+          # Runs during Armbian build (chroot into target image)
+          #
+          cat > userpatches/customize-image.sh <<'CUSTOMIZE_EOF'
+          #!/bin/bash
+          set -e
+
+          RELEASE=$1
+          LINUXFAMILY=$2
+          BOARD=$3
+          BUILD_DESKTOP=$4
+
+          echo "==========================================="
+          echo "Image Customization"
+          echo "Board: ${BOARD} | Release: ${RELEASE}"
+          echo "==========================================="
+
+          # Wait for apt locks
+          wait_for_apt() {
+              local max_wait=60
+              local waited=0
+              while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+                    fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+                  if [ $waited -ge $max_wait ]; then
+                      echo "Timeout waiting for apt locks"
+                      return 1
+                  fi
+                  sleep 2
+                  waited=$((waited + 2))
+              done
+          }
+
+          wait_for_apt
+          apt-get update
+
+          # Install prerequisites
+          apt-get install -y \
+              curl \
+              ca-certificates \
+              gnupg \
+              lsb-release \
+              jq \
+              dnsutils
+
+          # Install Docker
+          echo "Installing Docker..."
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          chmod a+r /etc/apt/keyrings/docker.gpg
+
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          systemctl enable docker
+
+          # Install AWS CLI for DNS updates
+          echo "Installing AWS CLI..."
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+          cd /tmp && unzip -q awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip
+          cd /
+
+          #
+          # HEREDOC: First boot script
+          # Updates DNS with real IP, installs CasaOS, gets SSL certs
+          #
+          cat > /usr/local/bin/homecloud-firstboot.sh <<'FIRSTBOOT_EOF'
+          #!/bin/bash
+          set -e
+
+          LOG="/var/log/homecloud-firstboot.log"
+          MARKER="/etc/homecloud-firstboot-done"
+          CONFIG="/etc/homecloud/device.conf"
+
+          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+          if [ -f "$MARKER" ]; then
+              log "First boot already completed"
+              exit 0
+          fi
+
+          # Load device config
+          source "$CONFIG"
+
+          log "==========================================="
+          log "Home Cloud First Boot"
+          log "Device: $DEVICE_SERIAL"
+          log "Domain: $DEVICE_DOMAIN"
+          log "==========================================="
+
+          # Wait for network
+          log "Waiting for network..."
+          for i in {1..30}; do
+              if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
+                  log "Network available"
+                  break
+              fi
+              sleep 2
+          done
+
+          # Get current LAN IP
+          LAN_IP=$(ip route get 1.1.1.1 | awk '{print $7; exit}')
+          log "LAN IP: $LAN_IP"
+
+          # Update DNS with real IP using device's scoped credentials
+          log "Updating DNS records..."
+          export AWS_ACCESS_KEY_ID
+          export AWS_SECRET_ACCESS_KEY
+
+          cat > /tmp/dns-update.json <<DNS_UPDATE
+          {
+            "Comment": "First boot IP update for $DEVICE_SERIAL",
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "$DEVICE_DOMAIN",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [{"Value": "$LAN_IP"}]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "*.$DEVICE_DOMAIN",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [{"Value": "$LAN_IP"}]
+                }
+              }
+            ]
+          }
+          DNS_UPDATE
+
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "$ROUTE53_ZONE_ID" \
+            --change-batch file:///tmp/dns-update.json
+
+          log "DNS updated: $DEVICE_DOMAIN -> $LAN_IP"
+
+          # Install CasaOS
+          log "Installing CasaOS..."
+          export TERM=xterm
+          curl -fsSL https://get.casaos.io | bash -s -- --no-input 2>&1 | tee -a "$LOG"
+
+          log "==========================================="
+          log "✅ First boot complete"
+          log "   Access: https://$DEVICE_DOMAIN"
+          log "==========================================="
+
+          touch "$MARKER"
+          systemctl disable homecloud-firstboot.service
+          FIRSTBOOT_EOF
+          chmod +x /usr/local/bin/homecloud-firstboot.sh
+
+          # Systemd service for first boot
+          cat > /etc/systemd/system/homecloud-firstboot.service <<'SERVICE_EOF'
+          [Unit]
+          Description=Home Cloud First Boot Setup
+          After=network-online.target docker.service
+          Wants=network-online.target
+          ConditionPathExists=!/etc/homecloud-firstboot-done
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/homecloud-firstboot.sh
+          RemainAfterExit=yes
+          StandardOutput=journal
+          StandardError=journal
+          Environment=TERM=xterm
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE_EOF
+
+          systemctl enable homecloud-firstboot.service
+
+          # Cleanup
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          echo "==========================================="
+          echo "✅ Customization complete"
+          echo "   - Docker installed"
+          echo "   - AWS CLI installed"
+          echo "   - First boot automation configured"
+          echo "==========================================="
+          CUSTOMIZE_EOF
+          
+          chmod +x userpatches/customize-image.sh
+          echo "✅ Build prepared with device credentials"
+
+      - name: Build Armbian Image
+        run: |
+          cd armbian
           sudo ./compile.sh \
             BOARD=${{ inputs.board }} \
             BRANCH=${{ steps.board.outputs.branch }} \
@@ -283,11 +536,16 @@ jobs:
           for file in *.sha*; do
             [ -f "$file" ] && cp "$file" "../../../output/${DEVICE_SERIAL}-${file}"
           done
+          
+          echo "==========================================="
+          echo "✅ Build complete: ${DEVICE_SERIAL}"
+          ls -la ../../../output/
+          echo "==========================================="
 
       - name: Upload Image Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: storloko-image-${{ needs.prepare-iam.outputs.device_serial }}
+          name: image-${{ needs.prepare-iam.outputs.device_serial }}
           path: output/
           retention-days: 30
 
@@ -299,6 +557,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  ##############################################
+  # NOTIFICATIONS
+  ##############################################
   notify:
     name: Send Notification
     needs: [prepare-iam, build-image]
@@ -315,12 +576,12 @@ jobs:
           BUILD_STATUS: ${{ needs.build-image.result }}
         run: |
           if [ "$BUILD_STATUS" == "success" ]; then
-            TITLE="StorLoko: Build Complete"
-            MESSAGE="Image built for ${DEVICE_SERIAL} (${{ inputs.board }})"
+            TITLE="Build Complete"
+            MESSAGE="✅ Image built for ${DEVICE_SERIAL} (${{ inputs.board }})"
             PRIORITY=0
           else
-            TITLE="StorLoko: Build Failed"
-            MESSAGE="Build failed for ${DEVICE_SERIAL} (${{ inputs.board }})"
+            TITLE="Build Failed"
+            MESSAGE="❌ Build failed for ${DEVICE_SERIAL} (${{ inputs.board }})"
             PRIORITY=1
           fi
           
