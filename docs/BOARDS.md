@@ -13,7 +13,6 @@ Entry-level devices suitable for single-user deployments with lightweight servic
 | Board | SoC | RAM | Storage | Use Case |
 |-------|-----|-----|---------|----------|
 | Rock Pi 4C+ | RK3399-T | 4GB | eMMC/SD | Password manager, light file sync |
-| Rock Pi 4B | RK3399 | 2-4GB | eMMC/SD | Same as 4C+ |
 | Orange Pi 4 LTS | RK3399 | 4GB | eMMC/SD | Budget option |
 
 **Recommended Apps:** Vaultwarden only
@@ -24,8 +23,7 @@ Family/small office deployments with photo backup and media streaming.
 
 | Board | SoC | RAM | Storage | Use Case |
 |-------|-----|-----|---------|----------|
-| Orange Pi 5 Pro | RK3588S | 16GB | NVMe/eMMC | Full app suite |
-| Orange Pi 5 | RK3588S | 4-16GB | NVMe/eMMC | Flexible option |
+| Orange Pi 5 Pro | RK3588S | 4GB | NVMe/eMMC | Full app suite |
 
 **Recommended Apps:** Vaultwarden, Nextcloud, Immich (light), Jellyfin
 
@@ -43,15 +41,15 @@ Power users, ML workloads, multi-user environments.
 ## Hardware Selection Guide
 
 ### For Personal Use (1-2 users)
-- **Budget:** Rock Pi 4C+ ($60-80)
-- **Best Value:** Orange Pi 5 Pro ($150)
+- **Budget:** Rock Pi 4C+ 
+- **Best Value:** Orange Pi 5 Pro 
 
 ### For Family (3-5 users)
-- **Recommended:** Orange Pi 5 Pro 16GB ($150)
-- **With ML:** Orange Pi 5 Ultra ($200+)
+- **Recommended:** Orange Pi 5 Pro 16GB 
+- **With ML:** Orange Pi 5 Ultra 
 
 ### For Small Office (5-10 users)
-- **Recommended:** Intel N100 mini PC ($200-300)
+- **Recommended:** Intel N100 mini PC 
 - **With redundancy:** Proxmox cluster with x86
 
 ## SoC Capabilities

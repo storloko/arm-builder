@@ -30,7 +30,7 @@ stages:
 
 # Notification template job
 .notify:
-  image: registry.gh1.ac7.top/storloko/arm-builder/alpine-notify:1.0
+  image: registry.gh1.internal.storloko.com/storloko/arm-builder/alpine-notify:1.0
   tags:
     - docker
   before_script:
@@ -49,7 +49,7 @@ cache:
 prepare:iam:
   stage: prepare
   image: 
-    name: registry.gh1.ac7.top/storloko/storloko-iam-provisioner:latest
+    name: registry.gh1.internal.storloko.com/storloko/storloko-iam-provisioner:latest
     entrypoint: [""]
   tags:
     - docker
@@ -193,9 +193,9 @@ build:rockpi-4cplus:
           [ -f "$file" ] && mv "$file" "${DEVICE_SERIAL}-${file}"
         done
         for file in *; do
-          curl -X MKCOL "http://repo1.ac7.top/storloko-builds/${BUILD_DATE}/" || true
-          curl -X MKCOL "http://repo1.ac7.top/storloko-builds/${BUILD_DATE}/${DEVICE_SERIAL}/" || true
-          curl -T "$file" "http://repo1.ac7.top/storloko-builds/${BUILD_DATE}/${DEVICE_SERIAL}/$file"
+          curl -X MKCOL "http://repo1.internal.storloko.com/storloko-builds/${BUILD_DATE}/" || true
+          curl -X MKCOL "http://repo1.internal.storloko.com/storloko-builds/${BUILD_DATE}/${DEVICE_SERIAL}/" || true
+          curl -T "$file" "http://repo1.internal.storloko.com/storloko-builds/${BUILD_DATE}/${DEVICE_SERIAL}/$file"
         done
       fi
   artifacts:

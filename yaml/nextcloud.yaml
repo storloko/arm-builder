@@ -9,7 +9,7 @@ services:
     environment:
       - POSTGRES_DB=nextcloud
       - POSTGRES_USER=nextcloud
-      - POSTGRES_PASSWORD=KZ2WtcmWE3DuBtKU89Ce4NWwJrCKPQTx
+      - POSTGRES_PASSWORD=GENERATE_STRONG_PASSWORD_HERE
     networks:
       - nextcloud-network
 
@@ -31,7 +31,7 @@ services:
       - POSTGRES_HOST=nextcloud-db
       - POSTGRES_DB=nextcloud
       - POSTGRES_USER=nextcloud
-      - POSTGRES_PASSWORD=KZ2WtcmWE3DuBtKU89Ce4NWwJrCKPQTx
+      - POSTGRES_PASSWORD=GENERATE_STRONG_PASSWORD_HERE
       - REDIS_HOST=nextcloud-redis
       - OVERWRITEPROTOCOL=https
       - OVERWRITEHOST=nextcloud.DEVICE_HOSTNAME.cust.storloko.com
@@ -59,7 +59,7 @@ services:
       - POSTGRES_HOST=nextcloud-db
       - POSTGRES_DB=nextcloud
       - POSTGRES_USER=nextcloud
-      - POSTGRES_PASSWORD=KZ2WtcmWE3DuBtKU89Ce4NWwJrCKPQTx
+      - POSTGRES_PASSWORD=GENERATE_STRONG_PASSWORD_HERE
     volumes:
       - /DATA/AppData/big-bear-nextcloud/html:/var/www/html
       - /DATA/Storage/nextcloud_data:/var/www/html/data

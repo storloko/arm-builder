@@ -4,7 +4,7 @@ Thank you for your interest in contributing!
 
 ## Project Status
 
-This project was developed by StorLoko Pty Ltd (2024-2025) and is now open source. The original company is no longer operating, but the codebase is maintained for community use.
+This project was developed by StorLoko Pty Ltd (2025) and is now open source. The original company is no longer operating, but the codebase is maintained for community use.
 
 ## How to Contribute
 

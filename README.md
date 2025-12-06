@@ -42,7 +42,8 @@ Automated build system for homecloud device images using Armbian and GitLab CI/C
 | Board | Tier | SoC | RAM | Recommended Apps |
 |-------|------|-----|-----|------------------|
 | Rock Pi 4C+ | Basic | RK3399-T | 4GB | Vaultwarden |
-| Orange Pi 5 Pro | Mid | RK3588S | 16GB | All apps |
+| Orange Pi 4 LTS | Basic | RK3399-T | 4GB | Vaultwarden |
+| Orange Pi 5 Pro | Mid | RK3588S | 4GB | All apps |
 | Orange Pi 5 Ultra | Premium | RK3588 | 16GB+ | All apps + ML |
 | UEFI x86 | Premium | Intel N100+ | 16GB+ | All apps + ML |
 

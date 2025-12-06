@@ -11,7 +11,7 @@ services:
     environment:
       - PG_DATA=/var/lib/postgresql/data
       - POSTGRES_DB=immich
-      - POSTGRES_PASSWORD=casaos
+      - POSTGRES_PASSWORD=GENERATE_STRONG_PASSWORD_HERE
       - POSTGRES_USER=casaos
     hostname: immich-postgres
     image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0
@@ -37,7 +37,7 @@ services:
     environment:
       - DB_DATABASE_NAME=casaos
       - DB_HOSTNAME=immich-postgres
-      - DB_PASSWORD=casaos
+      - DB_PASSWORD=GENERATE_STRONG_PASSWORD_HERE
       - DB_PORT=5432
       - DB_USERNAME=casaos
       - REDIS_HOSTNAME=immich-redis
@@ -70,7 +70,7 @@ services:
     environment:
       - DB_DATABASE_NAME=immich
       - DB_HOSTNAME=immich-postgres
-      - DB_PASSWORD=casaos
+      - DB_PASSWORD=GENERATE_STRONG_PASSWORD_HERE
       - DB_PORT=5432
       - DB_USERNAME=casaos
       - IMMICH_MACHINE_LEARNING_URL=http://immich-machine-learning:3003
