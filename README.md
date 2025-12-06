@@ -6,6 +6,10 @@
 
 Automated build system for homecloud device images using Armbian and GitLab CI/CD. Generates pre-configured ARM device images with built-in DNS automation and SSL certificates.
 
+## Full Disclosure
+
+Copious usage was made of an LLM to clean up, generalise, and push this to GitHub for public consumption. All care has been taken but keep it in mind.
+
 ## What This Does
 
 - Builds custom Armbian images for ARM single-board computers
