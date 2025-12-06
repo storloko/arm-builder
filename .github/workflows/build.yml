@@ -1,0 +1,333 @@
+name: Build StorLoko Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Target board'
+        required: true
+        default: 'rockpi-4cplus'
+        type: choice
+        options:
+          - rockpi-4cplus
+          - orangepi5-ultra
+          - orangepi5pro
+          - orangepi4-lts
+          - uefi-x86
+          - rpi4b
+      device_serial:
+        description: 'Device serial (leave empty to auto-generate)'
+        required: false
+        type: string
+      release:
+        description: 'Ubuntu release'
+        required: false
+        default: 'noble'
+        type: choice
+        options:
+          - noble
+          - jammy
+          - bookworm
+
+env:
+  ARMBIAN_REPO: https://github.com/armbian/build
+  RELEASE: ${{ inputs.release || 'noble' }}
+  BUILD_MINIMAL: 'no'
+  BUILD_DESKTOP: 'no'
+
+jobs:
+  prepare-iam:
+    name: Prepare IAM Credentials
+    runs-on: ubuntu-latest
+    outputs:
+      device_serial: ${{ steps.generate.outputs.device_serial }}
+      device_hostname: ${{ steps.generate.outputs.device_hostname }}
+    
+    steps:
+      - name: Generate Device Serial
+        id: generate
+        run: |
+          if [ -n "${{ inputs.device_serial }}" ]; then
+            DEVICE_SERIAL="${{ inputs.device_serial }}"
+          else
+            DEVICE_SERIAL="sl-$(openssl rand -hex 4)"
+          fi
+          DEVICE_HOSTNAME="device-${DEVICE_SERIAL}"
+          echo "device_serial=${DEVICE_SERIAL}" >> $GITHUB_OUTPUT
+          echo "device_hostname=${DEVICE_HOSTNAME}" >> $GITHUB_OUTPUT
+          echo "Generated serial: ${DEVICE_SERIAL}"
+          echo "Hostname: ${DEVICE_HOSTNAME}"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+
+      - name: Create IAM User and Policy
+        env:
+          DEVICE_SERIAL: ${{ steps.generate.outputs.device_serial }}
+          DEVICE_HOSTNAME: ${{ steps.generate.outputs.device_hostname }}
+          ROUTE53_ZONE_ID: ${{ secrets.ROUTE53_ZONE_ID }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          DOMAIN_SUFFIX: ${{ vars.DOMAIN_SUFFIX || 'cust.storloko.com' }}
+        run: |
+          IAM_USERNAME="storloko-device-${DEVICE_SERIAL}"
+          echo "Creating IAM user: $IAM_USERNAME"
+          
+          # Create user (ignore if exists)
+          aws iam create-user \
+            --user-name "$IAM_USERNAME" \
+            --tags Key=Device,Value="$DEVICE_SERIAL" Key=Type,Value=StorLokoDevice \
+            2>/dev/null || echo "User already exists"
+          
+          # Create scoped policy
+          POLICY_NAME="storloko-device-${DEVICE_SERIAL}-route53"
+          cat > /tmp/iam-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "route53:GetChange",
+                  "route53:ListResourceRecordSets",
+                  "route53:ListHostedZones",
+                  "route53:ListHostedZonesByName"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": ["route53:ChangeResourceRecordSets"],
+                "Resource": "arn:aws:route53:::hostedzone/${ROUTE53_ZONE_ID}",
+                "Condition": {
+                  "ForAllValues:StringLike": {
+                    "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+                      "${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}",
+                      "*.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}",
+                      "_acme-challenge.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}",
+                      "_acme-challenge.*.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          
+          # Clean up old policy if exists
+          POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POLICY_NAME}"
+          aws iam detach-user-policy --user-name "$IAM_USERNAME" --policy-arn "$POLICY_ARN" 2>/dev/null || true
+          aws iam delete-policy --policy-arn "$POLICY_ARN" 2>/dev/null || true
+          
+          # Create and attach new policy
+          aws iam create-policy \
+            --policy-name "$POLICY_NAME" \
+            --policy-document file:///tmp/iam-policy.json \
+            --description "Route53 access for StorLoko device ${DEVICE_SERIAL}" || true
+          aws iam attach-user-policy --user-name "$IAM_USERNAME" --policy-arn "$POLICY_ARN"
+          
+          # Delete old access keys
+          OLD_KEYS=$(aws iam list-access-keys --user-name "$IAM_USERNAME" --query 'AccessKeyMetadata[*].AccessKeyId' --output text || echo "")
+          for KEY in $OLD_KEYS; do
+            aws iam delete-access-key --user-name "$IAM_USERNAME" --access-key-id "$KEY" || true
+          done
+          
+          # Create new access key and save to artifacts
+          ACCESS_KEY_JSON=$(aws iam create-access-key --user-name "$IAM_USERNAME")
+          mkdir -p credentials
+          echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.AccessKeyId' > credentials/aws_access_key_id.txt
+          echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.SecretAccessKey' > credentials/aws_secret_access_key.txt
+          echo "${DEVICE_SERIAL}" > credentials/device_serial.txt
+          echo "${DEVICE_HOSTNAME}" > credentials/device_hostname.txt
+
+      - name: Create Initial DNS Records
+        env:
+          DEVICE_HOSTNAME: ${{ steps.generate.outputs.device_hostname }}
+          ROUTE53_ZONE_ID: ${{ secrets.ROUTE53_ZONE_ID }}
+          DOMAIN_SUFFIX: ${{ vars.DOMAIN_SUFFIX || 'cust.storloko.com' }}
+        run: |
+          cat > /tmp/dns-changes.json <<EOF
+          {
+            "Comment": "Initial DNS setup for StorLoko device",
+            "Changes": [
+              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
+              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "vaultwarden.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
+              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "nextcloud.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
+              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "immich.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}},
+              {"Action": "UPSERT", "ResourceRecordSet": {"Name": "jellyfin.${DEVICE_HOSTNAME}.${DOMAIN_SUFFIX}", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "1.1.1.1"}]}}
+            ]
+          }
+          EOF
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "${ROUTE53_ZONE_ID}" \
+            --change-batch file:///tmp/dns-changes.json
+
+      - name: Upload Credentials
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-credentials
+          path: credentials/
+          retention-days: 7
+
+  build-image:
+    name: Build ${{ inputs.board }} Image
+    needs: prepare-iam
+    runs-on: ubuntu-latest
+    # For ARM64 native builds, use: runs-on: [self-hosted, arm64]
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Credentials
+        uses: actions/download-artifact@v4
+        with:
+          name: device-credentials
+          path: credentials/
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget \
+            build-essential \
+            qemu-user-static \
+            binfmt-support \
+            debootstrap \
+            libssl-dev \
+            u-boot-tools \
+            device-tree-compiler
+
+      - name: Clone Armbian
+        run: |
+          git clone --depth 1 ${{ env.ARMBIAN_REPO }} armbian
+
+      - name: Set Board Variables
+        id: board
+        run: |
+          case "${{ inputs.board }}" in
+            rockpi-4cplus)
+              echo "branch=edge" >> $GITHUB_OUTPUT
+              ;;
+            orangepi5-ultra|orangepi5pro)
+              echo "branch=vendor" >> $GITHUB_OUTPUT
+              ;;
+            orangepi4-lts)
+              echo "branch=edge" >> $GITHUB_OUTPUT
+              ;;
+            uefi-x86)
+              echo "branch=edge" >> $GITHUB_OUTPUT
+              ;;
+            rpi4b)
+              echo "branch=edge" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "branch=edge" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Build Armbian Image
+        env:
+          DEVICE_SERIAL: ${{ needs.prepare-iam.outputs.device_serial }}
+          DEVICE_HOSTNAME: ${{ needs.prepare-iam.outputs.device_hostname }}
+        run: |
+          cd armbian
+          
+          # Read device credentials
+          DEVICE_AWS_ACCESS_KEY_ID=$(cat ../credentials/aws_access_key_id.txt)
+          DEVICE_AWS_SECRET_ACCESS_KEY=$(cat ../credentials/aws_secret_access_key.txt)
+          
+          # Create userpatches overlay
+          mkdir -p userpatches/overlay/root/.storloko
+          
+          # Write device config
+          cat > userpatches/overlay/root/.storloko/config <<EOF
+          DEVICE_SERIAL=${DEVICE_SERIAL}
+          DEVICE_HOSTNAME=${DEVICE_HOSTNAME}
+          AWS_ACCESS_KEY_ID=${DEVICE_AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY=${DEVICE_AWS_SECRET_ACCESS_KEY}
+          EOF
+          
+          # Run build
+          sudo ./compile.sh \
+            BOARD=${{ inputs.board }} \
+            BRANCH=${{ steps.board.outputs.branch }} \
+            RELEASE=${{ env.RELEASE }} \
+            BUILD_MINIMAL=${{ env.BUILD_MINIMAL }} \
+            BUILD_DESKTOP=${{ env.BUILD_DESKTOP }} \
+            KERNEL_CONFIGURE=no \
+            COMPRESS_OUTPUTIMAGE="sha,xz"
+
+      - name: Rename and Prepare Artifacts
+        env:
+          DEVICE_SERIAL: ${{ needs.prepare-iam.outputs.device_serial }}
+        run: |
+          mkdir -p output
+          cd armbian/output/images/
+          for file in *.img*; do
+            [ -f "$file" ] && cp "$file" "../../../output/${DEVICE_SERIAL}-${file}"
+          done
+          for file in *.sha*; do
+            [ -f "$file" ] && cp "$file" "../../../output/${DEVICE_SERIAL}-${file}"
+          done
+
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: storloko-image-${{ needs.prepare-iam.outputs.device_serial }}
+          path: output/
+          retention-days: 30
+
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: output/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    name: Send Notification
+    needs: [prepare-iam, build-image]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Pushover Notification
+        if: vars.PUSHOVER_ENABLED == 'true'
+        env:
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER_KEY }}
+          DEVICE_SERIAL: ${{ needs.prepare-iam.outputs.device_serial }}
+          BUILD_STATUS: ${{ needs.build-image.result }}
+        run: |
+          if [ "$BUILD_STATUS" == "success" ]; then
+            TITLE="StorLoko: Build Complete"
+            MESSAGE="Image built for ${DEVICE_SERIAL} (${{ inputs.board }})"
+            PRIORITY=0
+          else
+            TITLE="StorLoko: Build Failed"
+            MESSAGE="Build failed for ${DEVICE_SERIAL} (${{ inputs.board }})"
+            PRIORITY=1
+          fi
+          
+          curl -s \
+            --form-string "token=${PUSHOVER_TOKEN}" \
+            --form-string "user=${PUSHOVER_USER}" \
+            --form-string "title=${TITLE}" \
+            --form-string "message=${MESSAGE}" \
+            --form-string "priority=${PRIORITY}" \
+            https://api.pushover.net/1/messages.json || true
