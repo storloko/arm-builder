@@ -1,0 +1,95 @@
+name: nextcloud
+services:
+  nextcloud-db:
+    image: postgres:15-alpine
+    container_name: nextcloud-db
+    restart: unless-stopped
+    volumes:
+      - /DATA/AppData/big-bear-nextcloud/db:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=nextcloud
+      - POSTGRES_USER=nextcloud
+      - POSTGRES_PASSWORD=KZ2WtcmWE3DuBtKU89Ce4NWwJrCKPQTx
+    networks:
+      - nextcloud-network
+
+  nextcloud-redis:
+    image: redis:7-alpine
+    container_name: nextcloud-redis
+    restart: unless-stopped
+    networks:
+      - nextcloud-network
+
+  nextcloud:
+    image: nextcloud:29-apache
+    container_name: nextcloud
+    restart: unless-stopped
+    depends_on:
+      - nextcloud-db
+      - nextcloud-redis
+    environment:
+      - POSTGRES_HOST=nextcloud-db
+      - POSTGRES_DB=nextcloud
+      - POSTGRES_USER=nextcloud
+      - POSTGRES_PASSWORD=KZ2WtcmWE3DuBtKU89Ce4NWwJrCKPQTx
+      - REDIS_HOST=nextcloud-redis
+      - OVERWRITEPROTOCOL=https
+      - OVERWRITEHOST=nextcloud.DEVICE_HOSTNAME.cust.storloko.com
+      - TRUSTED_PROXIES=172.16.0.0/12
+      - NEXTCLOUD_ADMIN_USER=admin
+      - NEXTCLOUD_ADMIN_PASSWORD=admin
+    volumes:
+      - /DATA/AppData/big-bear-nextcloud/html:/var/www/html
+      - /DATA/Storage/nextcloud_data:/var/www/html/data
+      - /opt/storloko/hostname:/device-info/hostname:ro
+      - /opt/storloko/scripts/nextcloud-entrypoint.sh:/docker-entrypoint-hooks.d/post-installation/99-nextcloud-config.sh:ro
+    ports:
+      - "7580:80"
+    networks:
+      - nextcloud-network
+
+  nextcloud-cron:
+    image: nextcloud:29-apache
+    container_name: nextcloud-cron
+    restart: unless-stopped
+    depends_on:
+      - nextcloud-db
+      - nextcloud-redis
+    environment:
+      - POSTGRES_HOST=nextcloud-db
+      - POSTGRES_DB=nextcloud
+      - POSTGRES_USER=nextcloud
+      - POSTGRES_PASSWORD=KZ2WtcmWE3DuBtKU89Ce4NWwJrCKPQTx
+    volumes:
+      - /DATA/AppData/big-bear-nextcloud/html:/var/www/html
+      - /DATA/Storage/nextcloud_data:/var/www/html/data
+    entrypoint: /cron.sh
+    networks:
+      - nextcloud-network
+
+networks:
+  nextcloud-network:
+    driver: bridge
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+    - arm
+  author: StorLoko
+  category: Cloud
+  description:
+    en_us: A safe home for all your data. Access & share your files, calendars, contacts, mail & more from any device, on your terms.
+  developer: Nextcloud
+  hostname: nextcloud.DEVICE_HOSTNAME.cust.storloko.com
+  icon: https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/Nextcloud/icon.png
+  index: /
+  is_uncontrolled: true
+  main: nextcloud
+  port_map: "443"
+  scheme: https
+  store_app_id: nextcloud
+  tagline:
+    en_us: A self-hosted productivity platform
+  title:
+    en_us: Nextcloud
