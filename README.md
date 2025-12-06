@@ -1,14 +1,17 @@
 # StorLoko ARM Builder
 
-Automated build system for StorLoko homecloud device images using Armbian and GitLab CI/CD.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Overview
+> **Project Status:** StorLoko was an Australian privacy-focused homecloud hardware company (2024-2025). This repository is now open source for the community to learn from, fork, and build upon.
 
-This repository builds custom ARM device images with:
-- **Per-device IAM credentials** for DNS-01 SSL certificate automation
-- **Pre-installed applications** via CasaOS (Vaultwarden, Nextcloud, Immich, Jellyfin)
-- **Zero-touch provisioning** - Factory provision → Customer deployment
-- **Tiered deployment** based on device hardware capability
+Automated build system for homecloud device images using Armbian and GitLab CI/CD. Generates pre-configured ARM device images with built-in DNS automation and SSL certificates.
+
+## What This Does
+
+- Builds custom Armbian images for ARM single-board computers
+- Creates per-device AWS IAM credentials scoped to a single DNS zone
+- Pre-installs self-hosted apps via CasaOS (Vaultwarden, Nextcloud, Immich, Jellyfin)
+- Enables zero-touch SSL certificates via DNS-01 challenge (works behind NAT)
 
 ## Architecture
 
@@ -18,72 +21,55 @@ This repository builds custom ARM device images with:
 ├─────────────────────────────────────────────────────────────────┤
 │  prepare:iam          │  build:board          │  after_script   │
 │  ├─ Generate serial   │  ├─ Clone Armbian     │  ├─ Upload to   │
-│  ├─ Create IAM user   │  ├─ Inject creds      │  │  repo1.ac7   │
-│  ├─ Scope to device   │  ├─ Build image       │  └─ Notify      │
-│  └─ Create DNS (1.1.1)│  └─ Compress & hash   │                 │
+│  ├─ Create IAM user   │  ├─ Build image       │  │  artifact    │
+│  ├─ Scope to device   │  ├─ Inject creds      │  │  server      │
+│  └─ Create DNS        │  └─ Compress & hash   │  └─ Notify      │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Device First Boot                            │
 ├─────────────────────────────────────────────────────────────────┤
-│  Factory Provision        │  Customer Deployment               │
-│  ├─ Set hostname          │  ├─ Detect LAN IP                  │
-│  ├─ Inject AWS creds      │  ├─ Update Route53 DNS             │
-│  ├─ Configure Caddy       │  ├─ Install CasaOS                 │
-│  └─ Create customer card  │  ├─ Deploy apps (tier-based)       │
-│                           │  └─ Start Caddy → Let's Encrypt    │
+│  1. Device boots with pre-baked AWS credentials                 │
+│  2. Detects LAN IP, updates Route53 DNS                         │
+│  3. Caddy requests Let's Encrypt cert via DNS-01                │
+│  4. All services available at https://device-xxx.yourdomain.com │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Supported Boards
 
-| Board | Tier | SoC | RAM | Apps |
-|-------|------|-----|-----|------|
+| Board | Tier | SoC | RAM | Recommended Apps |
+|-------|------|-----|-----|------------------|
 | Rock Pi 4C+ | Basic | RK3399-T | 4GB | Vaultwarden |
 | Orange Pi 5 Pro | Mid | RK3588S | 16GB | All apps |
 | Orange Pi 5 Ultra | Premium | RK3588 | 16GB+ | All apps + ML |
 | UEFI x86 | Premium | Intel N100+ | 16GB+ | All apps + ML |
+
+See [docs/BOARDS.md](docs/BOARDS.md) for detailed hardware information.
 
 ## Per-Device IAM Credentials
 
 Each device gets its own scoped AWS IAM credentials:
 
 ```
-IAM User: storloko-device-sl-abc12345
+IAM User: device-sl-abc12345
 Policy:   Can ONLY modify DNS for:
-          - device-sl-abc12345.cust.storloko.com
-          - *.device-sl-abc12345.cust.storloko.com
+          - device-sl-abc12345.cust.yourdomain.com
+          - *.device-sl-abc12345.cust.yourdomain.com
 ```
 
-**Why?** 
+**Why this matters:**
 - Devices can request SSL certificates via DNS-01 challenge
-- No port forwarding required (works behind NAT)
+- Works behind NAT (no port forwarding required)
 - Compromised device can't affect other customers
-
-## DNS & SSL Flow
-
-1. **Build time**: DNS records created pointing to `1.1.1.1` (placeholder)
-2. **Customer boot**: Device detects its LAN IP and updates Route53
-3. **Caddy starts**: Requests Let's Encrypt cert via DNS-01
-4. **Result**: Valid SSL on `https://device-sl-xxx.cust.storloko.com`
-
-## Device URLs
-
-After deployment, customers access their device via:
-
-| Service | DNS URL | IP Fallback |
-|---------|---------|-------------|
-| Main Portal | `https://device-sl-xxx.cust.storloko.com` | `https://192.168.x.x:443` |
-| Vaultwarden | `https://vaultwarden.device-sl-xxx.cust.storloko.com` | `https://192.168.x.x:8443` |
-| Nextcloud | `https://nextcloud.device-sl-xxx.cust.storloko.com` | `https://192.168.x.x:8444` |
-| Immich | `https://immich.device-sl-xxx.cust.storloko.com` | `https://192.168.x.x:8445` |
-| Jellyfin | `https://jellyfin.device-sl-xxx.cust.storloko.com` | `https://192.168.x.x:8446` |
+- Each device is cryptographically isolated
 
 ## Repository Structure
 
 ```
-├── .gitlab-ci.yml      # Complete build pipeline (all logic inline)
+├── .gitlab-ci.yml      # Complete build pipeline
+├── helper.sh           # Local build utilities
 ├── yaml/               # CasaOS app manifests
 │   ├── vaultwarden.yaml
 │   ├── nextcloud.yaml
@@ -96,54 +82,51 @@ After deployment, customers access their device via:
     └── TROUBLESHOOTING.md
 ```
 
+## Adapting for Your Own Use
+
+This was designed for a commercial product but the patterns are reusable:
+
+1. **Fork this repo**
+2. **Set up your own domain** with Route53 hosted zone
+3. **Configure CI/CD variables:**
+   - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (admin for IAM creation)
+   - `ROUTE53_ZONE_ID` (your hosted zone)
+   - `AWS_ACCOUNT_ID` (your AWS account)
+4. **Modify the CI file** to use your domain instead of `cust.storloko.com`
+5. **Set up a GitLab runner** with `arm64` and `docker` tags
+
 ## Key Design Decisions
 
 ### All Logic Inline in CI
 
-The `.gitlab-ci.yml` contains all scripts as heredocs. This is intentional:
-- **Armbian bug**: userpatches scripts are ignored if pre-existing
-- **Workaround**: Generate everything at build time within CI file
-- **Benefit**: Single source of truth, no sync issues
+The `.gitlab-ci.yml` contains all scripts as heredocs. This was intentional due to an Armbian bug where userpatches scripts are ignored if pre-existing in the repo. Everything is generated at build time.
 
 ### YAML Files Downloaded at Runtime
 
-App YAML files are downloaded from `repo.storloko.com/yaml/` during customer deployment:
-- Allows updates without rebuilding images
-- Device hostname injected via `sed` replacement
-- `DEVICE_HOSTNAME` placeholder in all YAMLs
-
-## Pipeline Triggers
-
-Trigger a build via GitLab API:
-
-```bash
-curl -X POST \
-  -F "token=$CI_TRIGGER_TOKEN" \
-  -F "ref=simple" \
-  -F "variables[BOARD]=rockpi-4cplus" \
-  -F "variables[DEVICE_SERIAL]=sl-custom123" \
-  https://gh1.ac7.top/api/v4/projects/25/trigger/pipeline
-```
+App YAML files are downloaded during first boot, allowing updates without rebuilding images. Device hostname is injected via `sed` replacement of the `DEVICE_HOSTNAME` placeholder.
 
 ## Requirements
 
-### GitLab Runner
-- `arm64` tagged runner for ARM builds
-- `docker` tagged runner for notifications
+- GitLab CI runner with `arm64` tag (for ARM builds)
+- GitLab CI runner with `docker` tag (for notifications/IAM)
 - 25GB+ disk space per build
+- AWS account with Route53
 
-### CI/CD Variables
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - Admin credentials for IAM
-- `ROUTE53_ZONE_ID` - Hosted zone for `cust.storloko.com`
-- `CI_PROVISION_TOKEN` - StorLoko API token
-- `CI_PUSHOVER_API_TOKEN` / `CI_PUSHOVER_USER_KEY` - Notifications
+## Related Projects
+
+If you're interested in self-hosted home cloud solutions, check out:
+- [Umbrel](https://github.com/getumbrel/umbrel)
+- [CasaOS](https://github.com/IceWhaleTech/CasaOS)
+- [Armbian](https://github.com/armbian/build)
 
 ## License
 
-MIT License - See LICENSE file
+MIT License - See [LICENSE](LICENSE) file.
 
-## Support
+## Contributing
 
-- **Documentation**: See `docs/` folder
-- **Issues**: GitLab Issues
-- **Email**: support@storloko.com
+This project is archived but PRs are welcome if you want to build on it. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+*Originally developed by [StorLoko Pty Ltd](https://storloko.com) for the APAC home cloud market.*
