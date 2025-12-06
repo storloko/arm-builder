@@ -1,0 +1,101 @@
+name: big-bear-immich-without-machine-learning
+services:
+  database:
+    cpu_shares: 90
+    container_name: immich-postgres
+    deploy:
+      resources:
+        limits:
+          memory: 15993M
+    environment:
+      - PG_DATA=/var/lib/postgresql/data
+      - POSTGRES_DB=immich
+      - POSTGRES_PASSWORD=casaos
+      - POSTGRES_USER=casaos
+    hostname: immich-postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0
+    labels:
+      icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+    restart: always
+    volumes:
+      - type: bind
+        source: /DATA/AppData/big-bear-immich/pgdata
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: true
+    networks:
+      - default
+    privileged: false
+  immich-server:
+    cpu_shares: 90
+    container_name: immich-server
+    depends_on:
+      database:
+        condition: service_started
+      redis:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 15993M
+    environment:
+      - DB_DATABASE_NAME=immich
+      - DB_HOSTNAME=immich-postgres
+      - DB_PASSWORD=casaos
+      - DB_PORT=5432
+      - DB_USERNAME=casaos
+      - REDIS_HOSTNAME=immich-redis
+    hostname: immich-server
+    image: ghcr.io/immich-app/immich-server:v2.2.3
+    labels:
+      icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+    ports:
+      - mode: ingress
+        target: 2283
+        published: "2283"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /DATA/AppData/big-bear-immich/upload
+        target: /usr/src/app/upload
+        bind:
+          create_host_path: true
+    networks:
+      - default
+    privileged: false
+  redis:
+    cpu_shares: 90
+    container_name: immich-redis
+    hostname: immich-redis
+    image: redis:6.2.20-alpine@sha256:2185e741f4c1e7b0ea9ca1e163a3767c4270a73086b6bbea2049a7203212fb7f
+    labels:
+      icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+    restart: always
+    networks:
+      - default
+    privileged: false
+networks:
+  default:
+    name: big-bear-immich-without-machine-learning_default
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  author: BigBearTechWorld
+  category: BigBearCasaOS
+  description:
+    en_us: Self-hosted photo and video storage without machine learning.
+  developer: immich
+  hostname: immich.DEVICE_HOSTNAME.cust.storloko.com
+  icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+  index: /
+  is_uncontrolled: false
+  main: immich-server
+  port_map: 443
+  scheme: https
+  store_app_id: big-bear-immich-without-machine-learning
+  tagline:
+    en_us: Immich without machine learning
+  title:
+    en_us: Immich without machine learning
