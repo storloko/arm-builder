@@ -1,0 +1,330 @@
+variables:
+  # Build configuration
+  BOARD: "rockpi-4cplus"
+  RELEASE: "noble"
+  BRANCH: "edge"
+  BUILD_MINIMAL: "no"
+  BUILD_DESKTOP: "no"
+  ARMBIAN_REPO: "https://github.com/armbian/build"
+  USE_CCACHE: "yes"
+  KERNEL_CPUS: "0"
+  ALLOW_ROOT: "yes"
+  COLUMNS: "160"
+  MANAGE_ACNG: "no"
+  ENABLE_EXTENSIONS: "preset-firstrun"
+  
+  # StorLoko DNS/SSL v4.0 Configuration - Per-Device IAM
+  STORLOKO_API_URL: "https://api.storloko.com"
+  STORLOKO_PROVISION_TOKEN: "$CI_PROVISION_TOKEN"
+  
+  # Device configuration (override via pipeline trigger)
+  DEVICE_SERIAL: ""  # Set via API trigger or generate in prep stage
+  # Pushover notifications
+  PUSHOVER_API_TOKEN: "$CI_PUSHOVER_API_TOKEN"
+  PUSHOVER_USER_KEY: "$CI_PUSHOVER_USER_KEY"
+
+stages:
+  - prepare
+  - build
+  - test
+
+# Notification template job
+.notify:
+  image: registry.gh1.ac7.top/storloko/arm-builder/alpine-notify:1.0
+  tags:
+    - docker
+  before_script:
+    - apk add --no-cache curl jq
+  allow_failure: true
+
+cache:
+  key: armbian-cache-${BOARD}
+  paths:
+    - armbian/cache/
+    - armbian/.git/
+
+#############################################
+# STAGE 1: PREPARE DEVICE IAM CREDENTIALS
+#############################################
+prepare:iam:
+  stage: prepare
+  image: 
+    name: registry.gh1.ac7.top/storloko/storloko-iam-provisioner:latest
+    entrypoint: [""]
+
+  tags:
+    - docker
+  before_script:
+    - yum install -y jq openssl bind-utils
+    - |
+      # Generate device serial if not provided
+      if [ -z "$DEVICE_SERIAL" ]; then
+        DEVICE_SERIAL="sl-$(openssl rand -hex 4)"
+        echo "Generated serial: $DEVICE_SERIAL"
+      else
+        echo "Using provided serial: $DEVICE_SERIAL"
+      fi
+      
+      echo "$DEVICE_SERIAL" > device_serial.txt
+      DEVICE_HOSTNAME="device-${DEVICE_SERIAL}"
+      echo "$DEVICE_HOSTNAME" > device_hostname.txt
+      
+      echo "=========================================="
+      echo "StorLoko Per-Device IAM Credential Setup"
+      echo "Serial: $DEVICE_SERIAL"
+      echo "Hostname: $DEVICE_HOSTNAME"
+      echo "=========================================="
+  
+  script:
+    - |
+      DEVICE_SERIAL=$(cat device_serial.txt)
+      DEVICE_HOSTNAME=$(cat device_hostname.txt)
+      IAM_USERNAME="storloko-device-${DEVICE_SERIAL}"
+      
+      echo "Creating IAM user: $IAM_USERNAME"
+      
+      # Create IAM user (ignore if exists)
+      aws iam create-user \
+        --user-name "$IAM_USERNAME" \
+        --tags Key=Device,Value="$DEVICE_SERIAL" Key=Type,Value=StorLokoDevice \
+        2>/dev/null || echo "User already exists"
+      
+      # Create IAM policy for this specific device
+      POLICY_NAME="storloko-device-${DEVICE_SERIAL}-route53"
+      
+      cat > /tmp/iam-policy.json <<EOF
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "route53:GetChange",
+              "route53:ListResourceRecordSets",
+              "route53:ListHostedZones",
+              "route53:ListHostedZonesByName"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Effect": "Allow",
+            "Action": [
+              "route53:ChangeResourceRecordSets"
+            ],
+            "Resource": "arn:aws:route53:::hostedzone/${ROUTE53_ZONE_ID}",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+                  "${DEVICE_HOSTNAME}.cust.storloko.com",
+                  "*.${DEVICE_HOSTNAME}.cust.storloko.com",
+                  "_acme-challenge.${DEVICE_HOSTNAME}.cust.storloko.com",
+                  "_acme-challenge.*.${DEVICE_HOSTNAME}.cust.storloko.com"
+                ]
+              }
+            }
+          }
+        ]
+      }
+      EOF
+      
+      echo "IAM Policy:"
+      cat /tmp/iam-policy.json
+      
+      # Create policy (delete old version if exists)
+      POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POLICY_NAME}"
+      
+      aws iam delete-user-policy \
+        --user-name "$IAM_USERNAME" \
+        --policy-name "$POLICY_NAME" 2>/dev/null || true
+      
+      aws iam delete-policy \
+        --policy-arn "$POLICY_ARN" 2>/dev/null || true
+      
+      aws iam create-policy \
+        --policy-name "$POLICY_NAME" \
+        --policy-document file:///tmp/iam-policy.json \
+        --description "Route53 access for StorLoko device ${DEVICE_SERIAL}" || true
+      
+      # Attach policy to user
+      aws iam attach-user-policy \
+        --user-name "$IAM_USERNAME" \
+        --policy-arn "$POLICY_ARN"
+      
+      echo "✅ IAM policy attached"
+      
+      # Delete old access keys (limit is 2 per user)
+      OLD_KEYS=$(aws iam list-access-keys --user-name "$IAM_USERNAME" --query 'AccessKeyMetadata[*].AccessKeyId' --output text || echo "")
+      for KEY in $OLD_KEYS; do
+        echo "Deleting old access key: $KEY"
+        aws iam delete-access-key --user-name "$IAM_USERNAME" --access-key-id "$KEY" || true
+      done
+      
+      # Create new access key
+      echo "Creating access key for device..."
+      ACCESS_KEY_JSON=$(aws iam create-access-key --user-name "$IAM_USERNAME")
+      
+      DEVICE_AWS_ACCESS_KEY_ID=$(echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.AccessKeyId')
+      DEVICE_AWS_SECRET_ACCESS_KEY=$(echo "$ACCESS_KEY_JSON" | jq -r '.AccessKey.SecretAccessKey')
+      
+      echo "$DEVICE_AWS_ACCESS_KEY_ID" > device_aws_access_key_id.txt
+      echo "$DEVICE_AWS_SECRET_ACCESS_KEY" > device_aws_secret_access_key.txt
+      
+      echo "✅ Device IAM credentials created"
+      echo "   Access Key ID: $DEVICE_AWS_ACCESS_KEY_ID"
+      echo "   (Secret key stored in artifact)"
+      
+      #############################################
+      # CREATE INITIAL DNS RECORDS IN ROUTE53
+      #############################################
+      
+      echo ""
+      echo "Creating DNS records in Route53..."
+      
+      cat > /tmp/dns-changes.json <<EOF
+      {
+        "Comment": "Initial DNS setup for StorLoko device ${DEVICE_SERIAL}",
+        "Changes": [
+          {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "${DEVICE_HOSTNAME}.cust.storloko.com",
+              "Type": "A",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "1.1.1.1"}]
+            }
+          },
+          {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "vaultwarden.${DEVICE_HOSTNAME}.cust.storloko.com",
+              "Type": "A",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "1.1.1.1"}]
+            }
+          },
+          {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "nextcloud.${DEVICE_HOSTNAME}.cust.storloko.com",
+              "Type": "A",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "1.1.1.1"}]
+            }
+          },
+          {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "immich.${DEVICE_HOSTNAME}.cust.storloko.com",
+              "Type": "A",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "1.1.1.1"}]
+            }
+          },
+          {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "jellyfin.${DEVICE_HOSTNAME}.cust.storloko.com",
+              "Type": "A",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "1.1.1.1"}]
+            }
+          }
+        ]
+      }
+      EOF
+      
+      echo "DNS change batch:"
+      cat /tmp/dns-changes.json
+      
+      # Apply DNS changes
+      CHANGE_ID=$(aws route53 change-resource-record-sets \
+        --hosted-zone-id "${ROUTE53_ZONE_ID}" \
+        --change-batch file:///tmp/dns-changes.json \
+        --query 'ChangeInfo.Id' \
+        --output text)
+      
+      echo "✅ DNS records created"
+      echo "   Change ID: ${CHANGE_ID}"
+      echo "   Records:"
+      echo "     - ${DEVICE_HOSTNAME}.cust.storloko.com"
+      echo "     - vaultwarden.${DEVICE_HOSTNAME}.cust.storloko.com"
+      echo "     - nextcloud.${DEVICE_HOSTNAME}.cust.storloko.com"
+      echo "     - immich.${DEVICE_HOSTNAME}.cust.storloko.com"
+      echo "     - jellyfin.${DEVICE_HOSTNAME}.cust.storloko.com"
+      
+      # Wait for DNS propagation
+      echo ""
+      echo "Waiting for DNS propagation (30 seconds)..."
+      sleep 30
+      
+      # Verify DNS records
+      echo "Verifying DNS records..."
+      for subdomain in "" "vaultwarden" "nextcloud" "immich" "jellyfin"; do
+        if [ -z "$subdomain" ]; then
+          FQDN="${DEVICE_HOSTNAME}.cust.storloko.com"
+        else
+          FQDN="${subdomain}.${DEVICE_HOSTNAME}.cust.storloko.com"
+        fi
+        
+        RESOLVED=$(dig +short "$FQDN" @8.8.8.8 | head -1)
+        if [ "$RESOLVED" = "1.1.1.1" ]; then
+          echo "  ✅ $FQDN → $RESOLVED"
+        else
+          echo "  ⚠️  $FQDN → ${RESOLVED:-not resolved yet}"
+        fi
+      done
+      
+      # Register device with API
+      if [ -n "$STORLOKO_API_URL" ] && [ -n "$STORLOKO_PROVISION_TOKEN" ]; then
+        echo "Registering device with StorLoko API..."
+        
+        # Debug output
+        echo "API URL: ${STORLOKO_API_URL}"
+        echo "Token length: ${#STORLOKO_PROVISION_TOKEN}"
+        echo "Token preview: ${STORLOKO_PROVISION_TOKEN:0:20}..."
+        
+        # Make the API call with verbose output
+        RESPONSE=$(curl -w "\nHTTP_CODE:%{http_code}" -X POST "${STORLOKO_API_URL}/v1/devices/register" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer ${STORLOKO_PROVISION_TOKEN}" \
+          -d "{
+            \"serial\": \"${DEVICE_SERIAL}\",
+            \"hostname\": \"${DEVICE_HOSTNAME}\",
+            \"iam_user\": \"${IAM_USERNAME}\",
+            \"domains\": {
+              \"main\": \"${DEVICE_HOSTNAME}.cust.storloko.com\",
+              \"vaultwarden\": \"vaultwarden.${DEVICE_HOSTNAME}.cust.storloko.com\",
+              \"nextcloud\": \"nextcloud.${DEVICE_HOSTNAME}.cust.storloko.com\",
+              \"immich\": \"immich.${DEVICE_HOSTNAME}.cust.storloko.com\",
+              \"jellyfin\": \"jellyfin.${DEVICE_HOSTNAME}.cust.storloko.com\"
+            }
+          }")
+        
+        echo "API Response:"
+        echo "$RESPONSE"
+        
+        HTTP_CODE=$(echo "$RESPONSE" | grep -o "HTTP_CODE:[0-9]*" | cut -d: -f2)
+        echo "HTTP Status: ${HTTP_CODE}"
+        
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+          echo "✅ Device registered successfully"
+        else
+          echo "⚠️  API registration failed (non-fatal, device will still work)"
+        fi
+      fi
+      
+      echo "=========================================="
+      echo "✅ Device IAM Setup Complete"
+      echo "Device will use its own scoped credentials"
+      echo "=========================================="
+  
+  artifacts:
+    paths:
+      - device_serial.txt
+      - device_hostname.txt
+      - device_aws_access_key_id.txt
+      - device_aws_secret_access_key.txt
+    expire_in: 1 week
+
+# Note: Build jobs truncated for this commit - see full file for complete build stages
+# This includes rockpi-4cplus, orangepi5-ultra, uefi-x86, orangepi4-lts, orangepi5pro, rpi4b builds
