@@ -1,0 +1,76 @@
+# Build directories
+build/
+armbian/
+images/
+*.img
+*.img.xz
+*.img.gz
+*.sha
+*.sha256
+
+# Environment files
+.env
+*.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Compiled files
+*.pyc
+__pycache__/
+*.so
+*.o
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+*.rar
+*.7z
+
+# Secrets
+secrets/
+*.key
+*.pem
+*.crt
+id_rsa*
+
+# Cache
+cache/
+.cache/
+
+# Output artifacts
+# output/
+
+# Local configuration overrides
+config.local.yml
+docker-compose.override.yml
+
+# Device credentials (never commit)
+device_*.txt
